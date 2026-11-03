@@ -18,24 +18,76 @@ def main(page: ft.Page):
   # --- QUẢN LÝ DỮ LIỆU OFFLINE ---
   default_data = {
       "ingredients": {
-          "Ức gà sống": {"calo": 120.0, "protein": 22.5},
-          "Cơm trắng": {"calo": 130.0, "protein": 2.7},
-          "Trứng gà": {"calo": 155.0, "protein": 13.0},
-          "Thịt bò thăn": {"calo": 143.0, "protein": 22.0},
+          "Ức gà sống": {"type": "gram", "calo": 120.0, "protein": 22.5},
+          "Cơm trắng": {"type": "gram", "calo": 130.0, "protein": 2.7},
+          "Trứng gà": {"type": "suất", "calo": 75.0, "protein": 6.0},
+          "Phở bò (tô)": {"type": "suất", "calo": 500.0, "protein": 25.0},
       },
       "body_logs": {},
       "food_logs": {},
   }
 
+  def migrate_data(data):
+    # Đảm bảo tương thích với dữ liệu cũ đã lưu trên máy
+    for k, v in data.get("ingredients", {}).items():
+      if "type" not in v:
+        v["type"] = "gram"
+
+    for d_str, items in list(data.get("food_logs", {}).items()):
+      merged = {}
+      for item in items:
+        name = item["name"]
+        utype = item.get("unit", "gram")
+        if "amount" in item:
+          amt = float(item["amount"])
+        elif "grams" in item:
+          amt = float(item["grams"])
+          utype = "gram"
+        else:
+          raw = (
+              str(item.get("amount_str", "0"))
+              .replace("suất", "")
+              .replace("g", "")
+              .strip()
+          )
+          try:
+            amt = float(raw)
+          except ValueError:
+            amt = 0.0
+          utype = "suất" if "suất" in str(item.get("amount_str", "")) else "gram"
+
+        key = f"{name}__{utype}"
+        if key not in merged:
+          merged[key] = {
+              "name": name,
+              "amount": amt,
+              "unit": utype,
+              "calo": float(item["calo"]),
+              "protein": float(item["protein"]),
+          }
+        else:
+          merged[key]["amount"] = round(merged[key]["amount"] + amt, 1)
+          merged[key]["calo"] = round(merged[key]["calo"] + float(item["calo"]), 1)
+          merged[key]["protein"] = round(
+              merged[key]["protein"] + float(item["protein"]), 1
+          )
+      data["food_logs"][d_str] = list(merged.values())
+    return data
+
   def load_data():
     if os.path.exists(DATA_FILE):
       try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-          return json.load(f)
+          return migrate_data(json.load(f))
       except Exception:
         pass
     stored = page.client_storage.get("fitness_app_data")
-    return json.loads(stored) if stored else default_data
+    if stored:
+      try:
+        return migrate_data(json.loads(stored))
+      except Exception:
+        pass
+    return migrate_data(default_data)
 
   def save_data():
     try:
@@ -111,13 +163,13 @@ def main(page: ft.Page):
   file_picker = ft.FilePicker(on_result=on_file_picked)
   page.overlay.append(file_picker)
 
-  # --- TAB 1: NHẬT KÝ ĂN UỐNG HÀNG NGÀY ---
+  # --- TAB 1: NHẬT KÝ ĂN UỐNG HÀNG NGÀY (TỰ ĐỘNG CỘNG DỒN) ---
   active_stats_banner = ft.Container(
       padding=10, bgcolor="bluegrey900", border_radius=8
   )
-  food_dropdown = ft.Dropdown(label="Chọn nguyên liệu", expand=True)
-  food_grams_input = ft.TextField(
-      label="Số g", width=100, keyboard_type=ft.KeyboardType.NUMBER
+  food_dropdown = ft.Dropdown(label="Chọn nguyên liệu / món ăn", expand=True)
+  food_amount_input = ft.TextField(
+      label="Số g / suất", width=115, keyboard_type=ft.KeyboardType.NUMBER
   )
   daily_food_list = ft.Column(spacing=4)
   daily_summary_text = ft.Text(size=14, weight=ft.FontWeight.BOLD)
@@ -125,26 +177,50 @@ def main(page: ft.Page):
   def add_daily_food(e):
     ing_name = food_dropdown.value
     try:
-      grams = float(food_grams_input.value)
+      amount = float(food_amount_input.value)
     except (ValueError, TypeError):
       return
-    if not ing_name or ing_name not in app_data["ingredients"]:
+    if not ing_name or ing_name not in app_data["ingredients"] or amount <= 0:
       return
 
     ing_info = app_data["ingredients"][ing_name]
-    calo = round((grams / 100.0) * ing_info["calo"], 1)
-    protein = round((grams / 100.0) * ing_info["protein"], 1)
+    item_type = ing_info.get("type", "gram")
+
+    if item_type == "suất":
+      calo = round(amount * ing_info["calo"], 1)
+      protein = round(amount * ing_info["protein"], 1)
+    else:
+      calo = round((amount / 100.0) * ing_info["calo"], 1)
+      protein = round((amount / 100.0) * ing_info["protein"], 1)
 
     d_str = current_date[0]
     if d_str not in app_data["food_logs"]:
       app_data["food_logs"][d_str] = []
-    app_data["food_logs"][d_str].append({
-        "name": ing_name,
-        "grams": grams,
-        "calo": calo,
-        "protein": protein,
-    })
-    food_grams_input.value = ""
+
+    # Kiểm tra xem món ăn đã có trong ngày chưa để cộng dồn
+    existing_item = next(
+        (
+            item
+            for item in app_data["food_logs"][d_str]
+            if item["name"] == ing_name and item.get("unit", "gram") == item_type
+        ),
+        None,
+    )
+
+    if existing_item:
+      existing_item["amount"] = round(existing_item["amount"] + amount, 1)
+      existing_item["calo"] = round(existing_item["calo"] + calo, 1)
+      existing_item["protein"] = round(existing_item["protein"] + protein, 1)
+    else:
+      app_data["food_logs"][d_str].append({
+          "name": ing_name,
+          "amount": round(amount, 1),
+          "unit": item_type,
+          "calo": calo,
+          "protein": protein,
+      })
+
+    food_amount_input.value = ""
     save_data()
     refresh_all()
 
@@ -156,27 +232,43 @@ def main(page: ft.Page):
     refresh_all()
 
   # --- TAB 2: NHẬP LIỆU NGUYÊN LIỆU & THỂ TRẠNG ---
-  ing_name_in = ft.TextField(label="Tên nguyên liệu", expand=True)
+  ing_name_in = ft.TextField(label="Tên nguyên liệu / món ăn", expand=True)
+  ing_type_dropdown = ft.Dropdown(
+      label="Đơn vị tính",
+      value="gram",
+      options=[
+          ft.dropdown.Option("gram", "Theo 100g"),
+          ft.dropdown.Option("suất", "Theo 1 suất"),
+      ],
+      width=145,
+  )
   ing_calo_in = ft.TextField(
-      label="Calo/100g", width=120, keyboard_type=ft.KeyboardType.NUMBER
+      label="Calo", width=105, keyboard_type=ft.KeyboardType.NUMBER
   )
   ing_prot_in = ft.TextField(
-      label="Protein/100g", width=120, keyboard_type=ft.KeyboardType.NUMBER
+      label="Protein", width=105, keyboard_type=ft.KeyboardType.NUMBER
   )
   ing_list_view = ft.Column(spacing=4)
 
   def save_ingredient(e):
     name = ing_name_in.value.strip()
+    itype = ing_type_dropdown.value
     try:
       c = float(ing_calo_in.value)
       p = float(ing_prot_in.value)
     except (ValueError, TypeError):
       return
     if name:
-      app_data["ingredients"][name] = {"calo": c, "protein": p}
+      app_data["ingredients"][name] = {"type": itype, "calo": c, "protein": p}
       ing_name_in.value = ""
       ing_calo_in.value = ""
       ing_prot_in.value = ""
+      save_data()
+      refresh_all()
+
+  def delete_ingredient(name):
+    if name in app_data["ingredients"]:
+      del app_data["ingredients"][name]
       save_data()
       refresh_all()
 
@@ -251,7 +343,9 @@ def main(page: ft.Page):
       ],
       rows=[],
   )
-  weight_chart_container = ft.Container(height=200, padding=10)
+  weight_chart_container = ft.Container(
+      height=240, padding=ft.padding.only(top=15, right=20, left=5, bottom=5)
+  )
 
   def show_body_image(b64_str, d_str):
     dlg = ft.AlertDialog(
@@ -293,13 +387,19 @@ def main(page: ft.Page):
     day_deficit = round(active_body["tdee"] - total_c, 1)
 
     for idx, item in enumerate(day_foods):
+      unit_str = (
+          f"{item['amount']} suất"
+          if item.get("unit") == "suất"
+          else f"{item['amount']}g"
+      )
       daily_food_list.controls.append(
           ft.Row(
               alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
               controls=[
                   ft.Text(
-                      f"• {item['name']} ({item['grams']}g): {item['calo']} kcal | {item['protein']}g P",
+                      f"• {item['name']} ({unit_str}): {item['calo']} kcal | {item['protein']}g P",
                       size=13,
+                      expand=True,
                   ),
                   ft.TextButton(
                       "Xóa",
@@ -316,9 +416,22 @@ def main(page: ft.Page):
 
     ing_list_view.controls.clear()
     for k, v in app_data["ingredients"].items():
+      itype = v.get("type", "gram")
+      unit_label = "100g" if itype == "gram" else "suất"
       ing_list_view.controls.append(
-          ft.Text(
-              f"• {k}: {v['calo']} kcal/100g | {v['protein']}g P/100g", size=12
+          ft.Row(
+              alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+              controls=[
+                  ft.Text(
+                      f"• {k}: {v['calo']} kcal/{unit_label} | {v['protein']}g P/{unit_label}",
+                      size=12,
+                      expand=True,
+                  ),
+                  ft.TextButton(
+                      "Xóa",
+                      on_click=lambda e, name=k: delete_ingredient(name),
+                  ),
+              ],
           )
       )
 
@@ -361,10 +474,36 @@ def main(page: ft.Page):
     body_table.rows.clear()
     sorted_b_dates = sorted(app_data["body_logs"].keys())
     chart_points = []
+    bottom_labels = []
+
+    # Hiển thị tối đa 6 nhãn ngày trên trục ngang để không bị đè chữ
+    step = max(1, len(sorted_b_dates) // 5)
 
     for idx, b_date in enumerate(sorted_b_dates):
       b_info = app_data["body_logs"][b_date]
-      chart_points.append(ft.LineChartDataPoint(idx, b_info["weight"]))
+      w_val = b_info["weight"]
+      short_date = b_date[5:]  # Định dạng MM-DD
+
+      chart_points.append(
+          ft.LineChartDataPoint(
+              idx,
+              w_val,
+              tooltip=f"Ngày {short_date}\n{w_val} kg",
+              show_above_line=True,
+          )
+      )
+
+      if idx % step == 0 or idx == len(sorted_b_dates) - 1:
+        bottom_labels.append(
+            ft.ChartAxisLabel(
+                value=idx,
+                label=ft.Container(
+                    ft.Text(short_date, size=10, color="grey300"),
+                    padding=ft.padding.only(top=5),
+                ),
+            )
+        )
+
       img_btn = (
           ft.TextButton(
               "Xem",
@@ -378,8 +517,8 @@ def main(page: ft.Page):
       body_table.rows.append(
           ft.DataRow(
               cells=[
-                  ft.DataCell(ft.Text(b_date[5:])),
-                  ft.DataCell(ft.Text(str(b_info["weight"]))),
+                  ft.DataCell(ft.Text(short_date)),
+                  ft.DataCell(ft.Text(str(w_val))),
                   ft.DataCell(ft.Text(str(b_info["height"]))),
                   ft.DataCell(ft.Text(str(b_info["tdee"]))),
                   ft.DataCell(img_btn),
@@ -389,6 +528,18 @@ def main(page: ft.Page):
 
     if chart_points:
       weights = [app_data["body_logs"][d]["weight"] for d in sorted_b_dates]
+      min_w = int(min(weights)) - 2
+      max_w = int(max(weights)) + 2
+      y_step = max(1, (max_w - min_w) // 4)
+
+      left_labels = [
+          ft.ChartAxisLabel(
+              value=val,
+              label=ft.Text(f"{val}kg", size=10, color="grey300"),
+          )
+          for val in range(min_w, max_w + 1, y_step)
+      ]
+
       weight_chart_container.content = ft.LineChart(
           data_series=[
               ft.LineChartData(
@@ -396,10 +547,19 @@ def main(page: ft.Page):
                   stroke_width=3,
                   color="cyan",
                   curved=True,
+                  point=True,
               )
           ],
-          min_y=min(weights) - 2,
-          max_y=max(weights) + 2,
+          min_y=min_w,
+          max_y=max_w,
+          min_x=0,
+          max_x=max(1, len(sorted_b_dates) - 1),
+          left_axis=ft.ChartAxis(labels=left_labels, labels_size=40),
+          bottom_axis=ft.ChartAxis(labels=bottom_labels, labels_size=28),
+          horizontal_grid_lines=ft.ChartGridLines(
+              interval=y_step, color="grey800", width=1
+          ),
+          tooltip_bgcolor="bluegrey900",
           border=ft.border.all(1, "grey800"),
           expand=True,
       )
@@ -410,17 +570,39 @@ def main(page: ft.Page):
 
     page.update()
 
-  # --- THANH LỊCH & BỐ CỤC CHÍNH ---
-  calendar_bar = ft.Row(
-      alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-      controls=[
-          ft.ElevatedButton("<", width=45, on_click=lambda e: change_date(-1)),
-          date_label,
-          ft.ElevatedButton(
-              "Lịch", on_click=lambda e: page.open(date_picker)
-          ),
-          ft.ElevatedButton(">", width=45, on_click=lambda e: change_date(1)),
-      ],
+  # --- THANH LỊCH CÂN XỨNG HAI BÊN & BỐ CỤC CHÍNH ---
+  calendar_bar = ft.Container(
+      padding=ft.padding.symmetric(vertical=4, horizontal=4),
+      content=ft.Row(
+          alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+          vertical_alignment=ft.CrossAxisAlignment.CENTER,
+          controls=[
+              ft.ElevatedButton(
+                  "<",
+                  width=48,
+                  height=38,
+                  on_click=lambda e: change_date(-1),
+              ),
+              ft.Row(
+                  spacing=10,
+                  vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                  controls=[
+                      date_label,
+                      ft.ElevatedButton(
+                          "Lịch",
+                          height=38,
+                          on_click=lambda e: page.open(date_picker),
+                      ),
+                  ],
+              ),
+              ft.ElevatedButton(
+                  ">",
+                  width=48,
+                  height=38,
+                  on_click=lambda e: change_date(1),
+              ),
+          ],
+      ),
   )
 
   tabs = ft.Tabs(
@@ -433,7 +615,7 @@ def main(page: ft.Page):
                   scroll=ft.ScrollMode.AUTO,
                   controls=[
                       active_stats_banner,
-                      ft.Row([food_dropdown, food_grams_input]),
+                      ft.Row([food_dropdown, food_amount_input]),
                       ft.ElevatedButton(
                           "Thêm món ăn", on_click=add_daily_food
                       ),
@@ -467,12 +649,13 @@ def main(page: ft.Page):
                           "Lưu Thể trạng & Tính TDEE", on_click=save_body_stats
                       ),
                       ft.Text(
-                          "2. Thêm Nguyên liệu mới", weight=ft.FontWeight.BOLD
+                          "2. Thêm Nguyên liệu / Món ăn sẵn",
+                          weight=ft.FontWeight.BOLD,
                       ),
                       ing_name_in,
-                      ft.Row([ing_calo_in, ing_prot_in]),
+                      ft.Row([ing_type_dropdown, ing_calo_in, ing_prot_in]),
                       ft.ElevatedButton(
-                          "Lưu Nguyên liệu", on_click=save_ingredient
+                          "Lưu Nguyên liệu / Món", on_click=save_ingredient
                       ),
                       ing_list_view,
                   ],
@@ -485,7 +668,8 @@ def main(page: ft.Page):
                   controls=[
                       total_deficit_banner,
                       ft.Text(
-                          "Biểu đồ cân nặng", weight=ft.FontWeight.BOLD
+                          "Biểu đồ cân nặng (Chạm vào điểm để xem chi tiết)",
+                          weight=ft.FontWeight.BOLD,
                       ),
                       weight_chart_container,
                       ft.Text(
